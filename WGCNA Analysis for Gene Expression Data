@@ -1,0 +1,339 @@
+# WGCNA Analysis for Gene Expression Data
+# Weighted Gene Co-expression Network Analysis
+# Author: Kevin Calupiña
+# Date: 06/07/2025
+
+# Load required libraries
+library(WGCNA)              # Weighted correlation network analysis
+library(tidyr)              # Data processing
+library(dynamicTreeCut)     # Hierarchical clustering detection
+library(flashClust)         # Fast hierarchical clustering
+library(lattice)            # High-level data visualization
+library(survival)           # Survival analysis
+library(Hmisc)              # High-level graphics and statistics
+library(dplyr)              # Data manipulation
+
+# =============================================================================
+# DATA PREPARATION
+# =============================================================================
+
+# Load expression data (replace with your actual file path)
+vsd <- read.csv("path/to/your/expression_data.csv")
+
+# Define trait data
+traits <- data.frame(
+  ID = c("Grupo1CtrlH014", "Grupo2CtrlH020", "Grupo2CtrlM076", "Grupo3CtrlM038",
+         "Grupo2Ctrl21NH", "Grupo5CtrlH013", "Grupo5CtrlH011", "Grupo2NegatM059",
+         "Grupo2NegatM108", "Grupo5NegatM084", "Grupo5Negat48QP", "Grupo1PosM083",
+         "Grupo1PosM030", "Grupo2PosM072", "Grupo4Pos15II", "Grupo5PosM070",
+         "Grupo5PosM098"),
+  Control = c(1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+  M_B_pos = c(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1),
+  M_B_neg = c(0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0),
+  Ig_G_Toxo = c(1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0),
+  Complications = c(1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0, 1),
+  Sex_newborn = c(0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1)
+)
+
+# Display trait data
+print(traits)
+
+# Check if row names match column names
+table(rownames(traits) == colnames(vsd))
+
+# Format data for WGCNA
+SubGeneNames <- row.names(vsd)
+salmon <- as.data.frame(t(vsd))
+
+# =============================================================================
+# QUALITY CONTROL - CHECK FOR OUTLIERS
+# =============================================================================
+
+# Check for gene and sample outliers
+gsg <- goodSamplesGenes(salmon, verbose = 3)
+print(gsg$allOK)
+
+# Remove outliers if present
+if (!gsg$allOK) {
+  if (sum(!gsg$goodGenes) > 0) {
+    printFlush(paste("Removing genes:", paste(names(salmon)[!gsg$goodGenes], collapse = ", ")))
+  }
+  if (sum(!gsg$goodSamples) > 0) {
+    printFlush(paste("Removing samples:", paste(rownames(salmon)[!gsg$goodSamples], collapse = ", ")))
+  }
+  salmon <- salmon[gsg$goodSamples, gsg$goodGenes]
+}
+
+# =============================================================================
+# SOFT THRESHOLD SELECTION
+# =============================================================================
+
+# Define power range for soft threshold selection
+powers <- c(c(1:10), seq(from = 10, to = 30, by = 1))
+
+# Calculate soft threshold
+sft <- pickSoftThreshold(salmon,
+                        dataIsExpr = TRUE,
+                        powerVector = powers,
+                        corFnc = cor,
+                        corOptions = list(use = 'p'),
+                        verbose = 5,
+                        moreNetworkConcepts = TRUE,
+                        networkType = "signed")
+
+# Save soft threshold results
+write.table(sft$fitIndices, file = "soft_threshold_results.csv", 
+            sep = ",", quote = FALSE, row.names = TRUE)
+
+# Plot soft threshold analysis
+png("soft_threshold_analysis.png", width = 2000, height = 900, res = 150)
+par(mfrow = c(1, 3))
+cex1 <- 1.5
+
+# Scale-free topology fit index
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, Signed R^2",
+     type = "n", 
+     main = "Scale Independence")
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = cex1, col = "red")
+abline(h = 0.90, col = "red")
+abline(h = 0.92, col = "blue")
+abline(h = 0.95, col = "brown")
+
+# Mean connectivity
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity", 
+     type = "n", main = "Mean Connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 5], 
+     labels = powers, cex = cex1, col = "red")
+
+# Median connectivity
+plot(sft$fitIndices[, 1], sft$fitIndices[, 6],
+     xlab = "Soft Threshold (power)", ylab = "Median Connectivity", 
+     type = "n", main = "Median Connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 6], 
+     labels = powers, cex = cex1, col = "red")
+
+dev.off()
+
+# Set selected soft power threshold
+softPower <- 14
+
+# =============================================================================
+# ADJACENCY AND TOM MATRICES
+# =============================================================================
+
+# Calculate adjacency matrix
+adjacency <- adjacency(salmon, type = "signed", power = softPower)
+
+# Calculate Topological Overlap Matrix (TOM)
+TOM <- TOMsimilarity(adjacency, TOMType = "signed", power = softPower)
+dissTOM <- 1 - TOM
+
+# Preview dissimilarity matrix
+print(dissTOM[1:5, 1:5])
+
+# =============================================================================
+# HIERARCHICAL CLUSTERING
+# =============================================================================
+
+# Generate clustered gene tree
+geneTree <- hclust(as.dist(dissTOM), method = "average")
+
+# Plot gene clustering dendrogram
+png("gene_clustering_dendrogram.png", width = 1100, height = 800, res = 150)
+plot(geneTree, 
+     xlab = "Gene clusters", 
+     main = "Gene Clustering on TOM-based Dissimilarity", 
+     cex.main = 1, cex.axis = 1, cex = 0.3)
+dev.off()
+
+# =============================================================================
+# MODULE IDENTIFICATION
+# =============================================================================
+
+# Set minimum module size
+minModuleSize <- 35
+
+# Dynamic tree cutting for module identification
+dynamicMods <- cutreeDynamic(dendro = geneTree, 
+                            distM = dissTOM,
+                            deepSplit = 2,
+                            pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+
+# Display module sizes
+print(table(dynamicMods))
+
+# Convert numeric labels to colors
+dynamicColors <- labels2colors(dynamicMods)
+print(sort(table(dynamicColors), decreasing = TRUE))
+
+# Plot dendrogram with module colors
+png("dynamic_tree_cut.png", width = 1200, height = 800, res = 150)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.05,
+                    addGuide = TRUE, guideHang = 0.1,
+                    cex.main = 1,
+                    main = "Gene Dendrogram and Module Colors")
+dev.off()
+
+# =============================================================================
+# TOPOLOGICAL OVERLAP MATRIX VISUALIZATION
+# =============================================================================
+
+# Plot TOM heatmap
+png("TOM_heatmap.png", width = 1600, height = 800, res = 150)
+diag(dissTOM) <- NA
+TOMplot(dissTOM, geneTree, as.character(dynamicColors),
+        ColorsLeft = dynamicColors, terrainColors = TRUE,
+        main = "Topological Overlap Matrix Heatmap")
+dev.off()
+
+# =============================================================================
+# MODULE MERGING
+# =============================================================================
+
+# Calculate module eigengenes
+MEList <- moduleEigengenes(salmon, colors = dynamicColors,
+                          excludeGrey = TRUE, softPower = softPower)
+MEs <- MEList$eigengenes
+
+# Calculate dissimilarity of module eigengenes
+MEDiss <- 1 - cor(MEs)
+METree <- hclust(as.dist(MEDiss), method = "average")
+
+# Plot module eigengene clustering
+png("module_eigengenes_clustering.png", width = 1200, height = 800, res = 150)
+plot(METree, 
+     main = "Clustering of Module Eigengenes", 
+     cex.main = 1.2, xlab = "", ylab = "", cex = 0.5, sub = "")
+abline(h = 0.50, col = "red")
+
+# Set threshold for merging modules
+MEDissThres <- 0.10
+abline(h = MEDissThres, col = "red")
+dev.off()
+
+# Merge similar modules
+merge <- mergeCloseModules(salmon, dynamicColors, 
+                          cutHeight = MEDissThres, verbose = 3)
+
+# Extract merged results
+mergedColors <- merge$colors
+mergedMEs <- merge$newMEs
+
+# Display merged module sizes
+print(sort(table(mergedColors), decreasing = TRUE))
+write.table(sort(table(mergedColors), decreasing = TRUE), 
+            file = "merged_module_sizes.txt", sep = ",", 
+            quote = FALSE, row.names = FALSE)
+
+# Plot comparison of original and merged modules
+png("merged_modules_comparison.png", width = 1600, height = 800, res = 150)
+plotDendroAndColors(geneTree, 
+                    cbind(dynamicColors, mergedColors), 
+                    c("Dynamic Tree Cut", "Merged Modules"), 
+                    dendroLabels = FALSE, cex.main = 1,
+                    hang = 0.03, addGuide = TRUE, guideHang = 0.05,
+                    main = "Module Comparison: Original vs Merged")
+dev.off()
+
+# Update variables with merged results
+moduleColors <- mergedColors
+colorOrder <- c("grey", standardColors(50))
+moduleLabels <- match(mergedColors, colorOrder) - 1
+MEs <- mergedMEs
+
+# =============================================================================
+# EXPORT MODULES
+# =============================================================================
+
+# Export original modules
+module_colors <- setdiff(unique(dynamicColors), "grey")
+for (color in module_colors) {
+  module <- SubGeneNames[which(dynamicColors == color)]
+  write.table(module, paste("module_", color, ".txt", sep = ""), 
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+}
+
+# Export merged modules
+module_colors <- setdiff(unique(mergedColors), "grey")
+for (color in module_colors) {
+  module <- SubGeneNames[which(mergedColors == color)]
+  write.table(module, paste("merged_module_", color, ".txt", sep = ""), 
+              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+}
+
+# =============================================================================
+# TOM VISUALIZATION FOR MERGED MODULES
+# =============================================================================
+
+# Plot TOM for merged modules
+png("TOM_merged_modules.png", width = 1600, height = 800, res = 150)
+diag(dissTOM) <- NA
+TOMplot(dissTOM, geneTree, as.character(mergedColors),
+        ColorsLeft = mergedColors, terrainColors = TRUE,
+        main = "TOM Heatmap - Merged Modules")
+dev.off()
+
+# =============================================================================
+# MODULE-TRAIT CORRELATION ANALYSIS
+# =============================================================================
+
+# Define sample and gene numbers
+nGenes <- ncol(salmon)
+nSamples <- nrow(salmon)
+
+# Recalculate module eigengenes with merged colors
+MEs0 <- moduleEigengenes(salmon, moduleColors)$eigengenes
+MEs <- orderMEs(MEs0)
+
+# Calculate module-trait correlations
+moduleTraitCor <- cor(MEs, traits, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+
+# Create text matrix for heatmap
+textMatrix <- paste(signif(moduleTraitCor, 2), "\n(", 
+                   signif(moduleTraitPvalue, 1), ")", sep = "")
+dim(textMatrix) <- dim(moduleTraitCor)
+
+# Plot module-trait correlation heatmap
+png("module_trait_correlation.png", width = 1000, height = 1000, res = 150)
+par(mar = c(6, 8.5, 3, 3))
+
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = names(traits),
+               yLabels = names(MEs),
+               ySymbols = names(MEs),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5,
+               zlim = c(-1, 1),
+               main = "Module-Trait Relationships")
+dev.off()
+
+# =============================================================================
+# SAVE RESULTS
+# =============================================================================
+
+# Save workspace for future analysis
+save(salmon, traits, moduleColors, MEs, moduleTraitCor, moduleTraitPvalue,
+     file = "WGCNA_analysis_results.RData")
+
+cat("WGCNA analysis completed successfully!\n")
+cat("Output files generated:\n")
+cat("- soft_threshold_analysis.png\n")
+cat("- gene_clustering_dendrogram.png\n")
+cat("- dynamic_tree_cut.png\n")
+cat("- TOM_heatmap.png\n")
+cat("- module_eigengenes_clustering.png\n")
+cat("- merged_modules_comparison.png\n")
+cat("- TOM_merged_modules.png\n")
+cat("- module_trait_correlation.png\n")
+cat("- Individual module gene lists (*.txt)\n")
+cat("- WGCNA_analysis_results.RData\n")
