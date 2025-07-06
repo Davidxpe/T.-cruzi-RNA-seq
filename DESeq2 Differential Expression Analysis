@@ -1,0 +1,439 @@
+# DESeq2 Differential Expression Analysis
+# RNA-seq Analysis for T. cruzi Infection Study
+# Author: Kevin Calupiña
+# Date: 06/07/2025
+# =============================================================================
+# LOAD REQUIRED LIBRARIES
+# =============================================================================
+
+library(tidyverse)
+library(DESeq2)
+library(PCAtools)
+library(ggplot2)
+library(GenomicFeatures)
+library(apeglm)
+library(genefilter)
+library(pheatmap)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(plotly)
+library(ggrepel)
+
+# =============================================================================
+# DATA LOADING AND PREPARATION
+# =============================================================================
+
+# Load expression data
+expression_data <- read.delim("expression_data.txt")
+rownames(expression_data) <- expression_data$NAME
+expression_data$NAME <- NULL
+
+# Rename specific column if needed
+names(expression_data)[6] <- "Grupo2Ctrl21NH"
+
+# Alternative data loading (if using different file)
+# star_data <- read.delim("Star_allexpression.txt")
+# rownames(star_data) <- star_data$X
+# star_data$X <- NULL
+
+# =============================================================================
+# METADATA SETUP
+# =============================================================================
+
+# Create metadata for samples
+metadata <- data.frame(
+  sample = colnames(expression_data),
+  condition = factor(c(
+    'Ctrl',     # Grupo1CtrlH014
+    'Positivo', # Grupo1PosM030
+    'Positivo', # Grupo1PosM083
+    'Ctrl',     # Grupo2CtrlH020
+    'Ctrl',     # Grupo2CtrlM076
+    'Ctrl',     # Grupo2Ctrl21NH
+    'Negativo', # Grupo2NegatM059
+    'Negativo', # Grupo2NegatM108
+    'Positivo', # Grupo2PosM072
+    'Ctrl',     # Grupo3CtrlM038
+    'Ctrl',     # Grupo4Ctrl16GB
+    'Positivo', # Grupo4Pos15II
+    'Ctrl',     # Grupo5CtrlH011
+    'Ctrl',     # Grupo5CtrlH013
+    'Negativo', # Grupo5Negat48QP
+    'Negativo', # Grupo5NegatM084
+    'Positivo', # Grupo5PosM070
+    'Positivo'  # Grupo5PosM098
+  ), levels = c('Ctrl', 'Positivo', 'Negativo'))
+)
+
+# Display metadata
+print(metadata)
+
+# =============================================================================
+# DESEQ2 OBJECT CREATION AND FILTERING
+# =============================================================================
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(
+  countData = expression_data, 
+  colData = metadata, 
+  design = ~ condition
+)
+
+# Set factor levels
+dds$condition <- factor(dds$condition, levels = c("Ctrl", "Positivo", "Negativo"))
+
+# Remove specific samples (quality control)
+samples_to_remove <- c("Grupo4Ctrl16GB", "Grupo5PosM098")
+dds <- dds[, !(colnames(dds) %in% samples_to_remove)]
+
+# Display remaining samples
+print(colnames(dds))
+
+# =============================================================================
+# PRE-FILTERING
+# =============================================================================
+
+# Method 1: Keep genes with at least 3 counts in at least 10 samples
+keep_genes <- rowSums(counts(dds) >= 3) >= 10
+dds <- dds[keep_genes, ]
+
+# Method 2: Remove genes with zero counts across all samples
+keep_nonzero <- rowSums(counts(dds) > 0) > 0
+dds <- dds[keep_nonzero, ]
+
+# Method 3: Keep genes with total counts > 30
+dds <- dds[rowSums(counts(dds)) > 30, ]
+
+print(paste("Number of genes after filtering:", nrow(dds)))
+
+# =============================================================================
+# NORMALIZATION
+# =============================================================================
+
+# Variance Stabilizing Transformation (VST)
+vsd <- vst(dds, blind = FALSE)
+vsd_matrix <- assay(vsd)
+vsd_df <- as.data.frame(vsd_matrix)
+
+# Save normalized data
+write.csv(vsd_df, file = "normalized_expression_data.csv", row.names = TRUE)
+
+# Alternative normalization: rlog transformation
+rld <- rlog(dds, blind = FALSE)
+
+# Estimate size factors
+dds <- estimateSizeFactors(dds)
+
+# =============================================================================
+# PRINCIPAL COMPONENT ANALYSIS (PCA)
+# =============================================================================
+
+# Basic PCA plot
+pca_plot <- plotPCA(vsd, intgroup = "condition") +
+  theme_minimal() +
+  ggtitle("PCA Plot - Sample Clustering")
+
+# Enhanced PCA with sample labels
+pca_labeled <- plotPCA(vsd, intgroup = "condition") +
+  geom_label_repel(aes(label = colnames(assay(vsd))), 
+                   segment.color = "grey50", 
+                   box.padding = 0.35, 
+                   point.padding = 0.5) +
+  theme_minimal() +
+  ggtitle("PCA Plot with Sample Labels")
+
+# Detailed PCA analysis using PCAtools
+pca_detailed <- pca(assay(vsd), scale = TRUE, metadata = colData(vsd))
+
+# Biplot
+biplot_plot <- biplot(pca_detailed, 
+                     lab = colnames(assay(vsd)), 
+                     colby = "condition", 
+                     legendPosition = "right",
+                     title = "PCA Biplot")
+
+# Scree plot
+scree_plot <- screeplot(pca_detailed, 
+                       title = "PCA Scree Plot")
+
+# =============================================================================
+# 3D PCA VISUALIZATION
+# =============================================================================
+
+# Prepare data for 3D PCA
+vsd_data <- assay(vsd)
+pca_result <- prcomp(t(vsd_data), scale. = TRUE)
+pca_coords <- pca_result$x
+
+# Create 3D PCA plot
+pca_3d <- plot_ly(
+  x = pca_coords[, 1],  # PC1
+  y = pca_coords[, 2],  # PC2
+  z = pca_coords[, 3],  # PC3
+  type = "scatter3d",
+  mode = "markers",
+  text = rownames(pca_coords),
+  color = colData(vsd)$condition,
+  marker = list(size = 8)
+) %>%
+  layout(
+    title = "3D PCA Plot",
+    scene = list(
+      xaxis = list(title = "PC1"),
+      yaxis = list(title = "PC2"),
+      zaxis = list(title = "PC3")
+    )
+  )
+
+# Save 3D plot
+htmlwidgets::saveWidget(as_widget(pca_3d), "pca_3d_plot.html")
+
+# =============================================================================
+# DIFFERENTIAL EXPRESSION ANALYSIS - COMBINED ANALYSIS
+# =============================================================================
+
+# Create combined condition (Positive + Negative vs Control)
+metadata$combined <- ifelse(metadata$condition == "Ctrl", "Ctrl", "PosNeg")
+metadata$combined <- factor(metadata$combined, levels = c("Ctrl", "PosNeg"))
+
+# Create DESeq2 object for combined analysis
+dds_combined <- DESeqDataSetFromMatrix(
+  countData = expression_data, 
+  colData = metadata, 
+  design = ~ combined
+)
+
+# Apply same filtering as before
+dds_combined <- dds_combined[, !(colnames(dds_combined) %in% samples_to_remove)]
+dds_combined <- dds_combined[rowSums(counts(dds_combined)) > 30, ]
+
+# Additional filtering
+smallestGroupSize <- 3
+keep_combined <- rowSums(counts(dds_combined) >= 3) >= smallestGroupSize
+dds_combined <- dds_combined[keep_combined, ]
+
+print(paste("Genes in combined analysis:", nrow(dds_combined)))
+
+# Run DESeq2 analysis
+dds_combined <- DESeq(dds_combined)
+
+# Get results for combined analysis
+res_combined <- results(dds_combined, contrast = c("combined", "PosNeg", "Ctrl"))
+summary(res_combined)
+
+# Log fold change shrinkage
+res_combined_shrunk <- lfcShrink(dds_combined, coef = "combined_PosNeg_vs_Ctrl", type = "apeglm")
+
+# MA plot for combined analysis
+ma_plot_combined <- plotMA(res_combined_shrunk, ylim = c(-5, 5), 
+                          main = "MA Plot: Positive/Negative vs Control")
+
+# Save combined results
+write.csv(as.data.frame(res_combined_shrunk), 
+          file = "results_combined_pos_neg_vs_ctrl.csv", 
+          row.names = TRUE)
+
+# =============================================================================
+# PAIRWISE DIFFERENTIAL EXPRESSION ANALYSIS
+# =============================================================================
+
+# Run DESeq2 on main dataset
+dds <- DESeq(dds)
+
+# Get all possible comparisons
+res_pos_vs_ctrl <- results(dds, contrast = c("condition", "Positivo", "Ctrl"))
+res_neg_vs_ctrl <- results(dds, contrast = c("condition", "Negativo", "Ctrl"))
+res_pos_vs_neg <- results(dds, contrast = c("condition", "Positivo", "Negativo"))
+
+# Display summaries
+print("Positive vs Control:")
+summary(res_pos_vs_ctrl)
+
+print("Negative vs Control:")
+summary(res_neg_vs_ctrl)
+
+print("Positive vs Negative:")
+summary(res_pos_vs_neg)
+
+# =============================================================================
+# VISUALIZATION OF RESULTS
+# =============================================================================
+
+# Get available result names
+resultsNames(dds)
+
+# Apply log fold change shrinkage to main comparison
+res_pos_vs_ctrl_shrunk <- lfcShrink(dds, coef = "condition_Positivo_vs_Ctrl", type = "apeglm")
+
+# MA plot with highlighted top gene
+ma_plot <- plotMA(res_pos_vs_ctrl_shrunk, ylim = c(-5, 5), 
+                  main = "MA Plot: Positive vs Control")
+
+# Highlight top significant gene
+top_gene <- rownames(res_pos_vs_ctrl_shrunk)[which.min(res_pos_vs_ctrl_shrunk$padj)]
+with(res_pos_vs_ctrl_shrunk[top_gene, ], {
+  points(baseMean, log2FoldChange, col = "dodgerblue", cex = 2, lwd = 2)
+  text(baseMean, log2FoldChange, top_gene, pos = 2, col = "dodgerblue")
+})
+
+# =============================================================================
+# HEATMAP OF TOP VARIABLE GENES
+# =============================================================================
+
+# Get top 20 most variable genes
+top_var_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+heatmap_matrix <- assay(vsd)[top_var_genes, ]
+heatmap_matrix <- heatmap_matrix - rowMeans(heatmap_matrix)
+
+# Create annotation for heatmap
+annotation_col <- as.data.frame(colData(vsd)[, c("sample", "condition")])
+
+# Generate heatmap
+heatmap_plot <- pheatmap(heatmap_matrix, 
+                        annotation_col = annotation_col,
+                        main = "Heatmap of Top 20 Variable Genes",
+                        show_rownames = TRUE,
+                        show_colnames = TRUE)
+
+# =============================================================================
+# GENE ANNOTATION
+# =============================================================================
+
+# Extract Ensembl IDs (first 15 characters)
+ensembl_ids <- substr(rownames(res_pos_vs_neg), 1, 15)
+
+# Map Ensembl IDs to gene symbols
+gene_symbols <- mapIds(org.Hs.eg.db,
+                      keys = ensembl_ids,
+                      column = "SYMBOL",
+                      keytype = "ENSEMBL",
+                      multiVals = "first")
+
+# Add gene symbols to results
+res_pos_vs_neg_annotated <- as.data.frame(res_pos_vs_neg)
+res_pos_vs_neg_annotated$SYMBOL <- gene_symbols
+res_pos_vs_neg_annotated$GID <- sub("\\..*", "", rownames(res_pos_vs_neg_annotated))
+
+# =============================================================================
+# EXPORT NORMALIZED DATA
+# =============================================================================
+
+# Save VST-normalized data
+write.table(vsd_df, 
+            file = "vst_normalized_data.txt", 
+            sep = "\t",
+            row.names = TRUE,
+            col.names = TRUE,
+            quote = FALSE)
+
+# =============================================================================
+# CREATE CLS FILE FOR GSEA
+# =============================================================================
+
+# Metadata for CLS file (filtered samples)
+metadata_cls <- data.frame(
+  sample = c("Grupo1CtrlH014", "Grupo1PosM030", "Grupo1PosM083", Grupo2CtrlM076, "Grupo2CtrlH020", 
+            "Grupo2Ctrl21NH", "Grupo2NegatM059", "Grupo2NegatM108", 
+            "Grupo2PosM072", "Grupo3CtrlM038", "Grupo4Pos15II", 
+            "Grupo5CtrlH011", "Grupo5CtrlH013", "Grupo5Negat48QP", 
+            "Grupo5NegatM084", "Grupo5PosM070"), 
+  condition = c("Ctrl", "Positivo", "Positivo", "Ctrl", "Ctrl", "Ctrl", "Negativo", 
+               "Negativo", "Positivo", "Ctrl", "Positivo", "Ctrl", "Ctrl", 
+               "Negativo", "Negativo", "Positivo")
+)
+
+# Create CLS file content
+num_samples <- nrow(metadata_cls)
+num_classes <- length(unique(metadata_cls$condition))
+class_names <- unique(metadata_cls$condition)
+class_labels <- metadata_cls$condition
+
+cls_content <- c(
+  paste(num_samples, num_classes, "1"),
+  paste("#", paste(class_names, collapse = " ")),
+  paste(class_labels, collapse = " ")
+)
+
+# Write CLS file
+writeLines(cls_content, "sample_classes.cls")
+
+# =============================================================================
+# IDENTIFY DIFFERENTIALLY EXPRESSED GENES (DEGs)
+# =============================================================================
+
+# Function to classify genes as UP, DOWN, or No DE
+classify_regulation <- function(df, padj_threshold = 0.05, lfc_threshold = 1) {
+  df$Regulation <- ifelse(df$padj <= padj_threshold & abs(df$log2FoldChange) >= lfc_threshold, 
+                         ifelse(df$log2FoldChange > 0, "UP", "DOWN"), 
+                         "No DE")
+  df$GID <- rownames(df)
+  return(df)
+}
+
+# Get all result objects
+result_objects <- ls(pattern = "^res_")
+
+# Process each result object
+for (obj_name in result_objects) {
+  # Get the result object
+  result_df <- get(obj_name)
+  
+  # Apply regulation classification
+  result_df <- classify_regulation(result_df)
+  
+  # Filter for differentially expressed genes only
+  deg_df <- result_df[result_df$Regulation != "No DE", ]
+  
+  # Create new name for DEG object
+  deg_name <- paste0("DEG_", obj_name)
+  
+  # Assign to environment
+  assign(deg_name, deg_df)
+  
+  # Print summary
+  cat(paste("Results for", obj_name, ":\n"))
+  cat(paste("  Total genes:", nrow(result_df), "\n"))
+  cat(paste("  Upregulated:", sum(result_df$Regulation == "UP", na.rm = TRUE), "\n"))
+  cat(paste("  Downregulated:", sum(result_df$Regulation == "DOWN", na.rm = TRUE), "\n"))
+  cat(paste("  Not DE:", sum(result_df$Regulation == "No DE", na.rm = TRUE), "\n\n"))
+}
+
+# =============================================================================
+# CLEAN UP DEG OBJECTS
+# =============================================================================
+
+# Get all DEG objects
+deg_objects <- ls(pattern = "^DEG_")
+
+# Remove rows with all NA values
+for (obj_name in deg_objects) {
+  deg_df <- get(obj_name)
+  # Keep rows that don't have NA in all columns
+  deg_df <- deg_df[!apply(is.na(deg_df), 1, all), ]
+  assign(obj_name, deg_df)
+  
+  # Save DEG results
+  write.csv(deg_df, file = paste0(obj_name, "_results.csv"), row.names = TRUE)
+}
+
+# =============================================================================
+# SUMMARY REPORT
+# =============================================================================
+
+cat("DESeq2 Analysis Completed Successfully!\n")
+cat("==============================================\n")
+cat("Output files generated:\n")
+cat("- normalized_expression_data.csv\n")
+cat("- vst_normalized_data.txt\n")
+cat("- results_combined_pos_neg_vs_ctrl.csv\n")
+cat("- DEG_*_results.csv (for each comparison)\n")
+cat("- sample_classes.cls\n")
+cat("- pca_3d_plot.html\n")
+cat("\nPlots generated:\n")
+cat("- PCA plots (2D and 3D)\n")
+cat("- MA plots\n")
+cat("- Heatmap of top variable genes\n")
+cat("- Scree plot\n")
+
+# Display session info
+sessionInfo()
